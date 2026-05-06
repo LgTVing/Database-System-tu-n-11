@@ -3,13 +3,16 @@
 
 import os
 import json
+from decimal import Decimal
 import mysql.connector
-from typing import List, Dict, Any
-import os
+from typing import List, Dict, Any, Optional
+
+import requests
+
 os.environ["LANGCHAIN_ALLOWED_OBJECTS"] = "core"
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import VectorParams, Distance, PointStruct
+from qdrant_client.http.models import VectorParams, Distance, PointStruct, SearchRequest
 from sentence_transformers import SentenceTransformer
 
 from langchain_classic.agents import AgentExecutor, create_openai_tools_agent
@@ -17,7 +20,7 @@ from langchain_classic.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain_community.llms import Ollama
+from langchain_community.chat_models import ChatOllama
 # from langchain.agents import AgentExecutor, create_openai_tools_agent
 
 
@@ -33,12 +36,13 @@ MYSQL_CONFIG = {
 }
 
 QDRANT_HOST = "localhost"
-QDRANT_PORT = 6333  # <- đổi sang port của qdrant-117
+QDRANT_PORT = 6333  
 COLLECTION_NAME = "products_collection"
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-OPENAI_API_KEY = os.getenv("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")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
 
 # =========================
@@ -112,11 +116,198 @@ def insert_products_into_qdrant():
 # =========================
 # [2] VECTOR SEARCH + LLM
 # =========================
-def get_llm():
+def _ollama_is_available(model: str) -> bool:
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=2)
+        if not response.ok:
+            return False
+
+        payload = response.json()
+        models = [item.get("name", "") for item in payload.get("models", [])]
+        return any(model in name for name in models)
+    except requests.RequestException:
+        return False
+
+
+def _normalize_sql_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized_rows: List[Dict[str, Any]] = []
+
+    for row in rows:
+        normalized_row: Dict[str, Any] = {}
+        for key, value in row.items():
+            if isinstance(value, Decimal):
+                normalized_row[key] = float(value)
+            else:
+                normalized_row[key] = value
+        normalized_rows.append(normalized_row)
+
+    return normalized_rows
+
+
+def _should_use_sql(query: str) -> bool:
+    lowered = query.lower()
+    sql_keywords = (
+        "giá cao nhất",
+        "cao nhất",
+        "đắt nhất",
+        "rẻ nhất",
+        "classic cars",
+        "thuộc dòng",
+        "dòng",
+        "msrp",
+        "buyprice",
+    )
+    return any(keyword in lowered for keyword in sql_keywords)
+
+
+def _format_local_answer(query: str, rows: List[Dict[str, Any]], source: str) -> str:
+    if not rows:
+        return f"Kết quả local ({source}) không tìm thấy sản phẩm phù hợp cho: {query}"
+
+    source_note = "SQL" if source == "sql" else "vector search"
+    lines = [f"Kết quả local ({source_note}), không dùng OpenAI:"]
+    list_text = _format_results_list(rows)
+    if list_text:
+        lines.append(list_text)
+
+    return "\n".join(lines)
+
+
+def _format_results_list(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+
+    lines: List[str] = []
+    for index, row in enumerate(rows, start=1):
+        product_name = row.get("productName", "N/A")
+        product_line = row.get("productLine", "N/A")
+        msrp = row.get("MSRP", row.get("msrp", "N/A"))
+        buy_price = row.get("buyPrice", row.get("buyprice", "N/A"))
+        lines.append(
+            f"{index}. {product_name} | dòng: {product_line} | MSRP: {msrp} | buyPrice: {buy_price}"
+        )
+
+    return "\n".join(lines)
+
+
+def _parse_tool_choice(text: str) -> str:
+    normalized = text.strip().upper()
+    if "SQL" in normalized:
+        return "sql"
+    if "VECTOR" in normalized:
+        return "vector"
+    return "vector"
+
+
+def _select_tool_with_llm(llm: object, query: str) -> str:
+    if _should_use_sql(query):
+        return "sql"
+
+    prompt = (
+        "Bạn là bộ phân loại tool.\n"
+        "Chỉ trả lời đúng 1 từ: SQL hoặc VECTOR.\n"
+        "Quy tắc:\n"
+        "- SQL: câu hỏi về giá cao nhất/thấp nhất, lọc theo dòng sản phẩm, hoặc cần thống kê/so sánh.\n"
+        "- VECTOR: câu hỏi tìm sản phẩm tương tự, gợi ý theo sở thích.\n"
+        f"Query: {query}"
+    )
+    response = llm.invoke(prompt)
+    content = getattr(response, "content", str(response))
+    return _parse_tool_choice(content)
+
+
+def _summarize_with_llm(
+    llm: object,
+    query: str,
+    rows: List[Dict[str, Any]],
+    source: str,
+) -> str:
+    list_text = _format_results_list(rows)
+    if not list_text:
+        return _format_local_answer(query, rows, source=source)
+
+    prompt = f"""
+Bạn là trợ lý tư vấn sản phẩm.
+Hãy viết 2-3 câu giải thích ngắn, dựa trên query và danh sách bên dưới.
+Không liệt kê lại danh sách. Không dịch sang tiếng Anh. Không bịa thêm.
+
+Query: {query}
+Danh sách:
+{list_text}
+"""
+    response = llm.invoke(prompt)
+    explanation = getattr(response, "content", str(response)).strip()
+
+    return f"{list_text}\n\n{explanation}".strip()
+
+
+class LocalAgentExecutor:
+    def invoke(self, inputs: Dict[str, Any]):
+        query = inputs["input"] if isinstance(inputs, dict) else str(inputs)
+
+        if _should_use_sql(query):
+            raw_output = tool_text_to_sql.invoke(query)
+            source = "sql"
+        else:
+            raw_output = tool_vector_search.invoke(query)
+            source = "vector"
+
+        print(f"[TOOL] {source.upper()} | query={query}")
+
+        try:
+            rows = json.loads(raw_output)
+        except json.JSONDecodeError:
+            rows = [{"raw": raw_output}]
+
+        return {
+            "output": _format_local_answer(query, rows, source),
+            "source": source,
+        }
+
+
+class LLMDecisionAgent:
+    def __init__(self, llm: object):
+        self.llm = llm
+
+    def invoke(self, inputs: Dict[str, Any]):
+        query = inputs["input"] if isinstance(inputs, dict) else str(inputs)
+
+        try:
+            choice = _select_tool_with_llm(self.llm, query)
+        except Exception:
+            choice = "vector"
+
+        print(f"[TOOL] {choice.upper()} | query={query}")
+
+        if choice == "sql":
+            raw_output = tool_text_to_sql.invoke(query)
+        else:
+            raw_output = tool_vector_search.invoke(query)
+
+        try:
+            rows = json.loads(raw_output)
+        except json.JSONDecodeError:
+            rows = [{"raw": raw_output}]
+
+        try:
+            summary = _summarize_with_llm(self.llm, query, rows, choice)
+        except Exception:
+            summary = _format_local_answer(query, rows, source=choice)
+
+        return {
+            "output": summary,
+            "source": choice,
+        }
+
+
+def get_llm() -> Optional[object]:
     if OPENAI_API_KEY:
         return ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    else:
-        return Ollama(model="llama3")
+
+    if _ollama_is_available(OLLAMA_MODEL):
+        return ChatOllama(model=OLLAMA_MODEL, temperature=0.2)
+
+    return None
 
 
 def vector_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
@@ -124,15 +315,20 @@ def vector_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
     query_vec = model.encode(query).tolist()
-    results = qdrant.search(
+    response = qdrant.http.search_api.search_points(
         collection_name=COLLECTION_NAME,
-        query_vector=query_vec,
-        limit=top_k
+        search_request=SearchRequest(
+            vector=query_vec,
+            limit=top_k,
+            with_payload=True,
+            with_vector=False,
+        ),
     )
+    results = response.result
 
     hits = []
     for r in results:
-        payload = r.payload
+        payload = dict(r.payload or {})
         payload["score"] = r.score
         hits.append(payload)
 
@@ -143,20 +339,13 @@ def search(query: str, top_k: int = 5) -> str:
     results = vector_search(query, top_k=top_k)
     llm = get_llm()
 
-    prompt = f"""
-Bạn là trợ lý tư vấn sản phẩm.
-Query: {query}
+    if llm is None:
+        return _format_local_answer(query, results, source="vector")
 
-Danh sách sản phẩm tìm thấy (JSON):
-{json.dumps(results, ensure_ascii=False, indent=2)}
-
-Hãy:
-- Trả về danh sách sản phẩm (tên, giá, dòng sản phẩm)
-- Giải thích ngắn vì sao phù hợp với query.
-"""
-
-    response = llm.invoke(prompt)
-    return response
+    try:
+        return _summarize_with_llm(llm, query, results, "vector")
+    except Exception:
+        return _format_local_answer(query, results, source="vector")
 
 
 # =========================
@@ -200,7 +389,7 @@ def tool_text_to_sql(query: str) -> str:
     cursor.close()
     conn.close()
 
-    return json.dumps(rows, ensure_ascii=False)
+    return json.dumps(_normalize_sql_rows(rows), ensure_ascii=False)
 
 
 def build_agent():
@@ -208,14 +397,23 @@ def build_agent():
 
     tools = [tool_vector_search, tool_text_to_sql]
 
+    if llm is None or not hasattr(llm, "bind_tools"):
+        return LocalAgentExecutor()
+
+    if isinstance(llm, ChatOllama):
+        return LLMDecisionAgent(llm)
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", "Bạn là trợ lý dữ liệu. Hãy chọn tool phù hợp để trả lời."),
         ("user", "{input}"),
         ("placeholder", "{agent_scratchpad}")
     ])
 
-    agent = create_openai_tools_agent(llm=llm, tools=tools, prompt=prompt)
-    return AgentExecutor(agent=agent, tools=tools, verbose=True)
+    try:
+        agent = create_openai_tools_agent(llm=llm, tools=tools, prompt=prompt)
+        return AgentExecutor(agent=agent, tools=tools, verbose=True)
+    except Exception:
+        return LocalAgentExecutor()
 
 
 def test_agent_queries():
