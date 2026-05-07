@@ -79,6 +79,10 @@ def build_qdrant_collection_if_not_exists(qdrant: QdrantClient, vector_size: int
 
 
 def insert_products_into_qdrant():
+    if not _is_qdrant_available():
+        print("[QDRANT] Chưa khởi động, bỏ qua bước insert.")
+        return
+
     model = SentenceTransformer(EMBED_MODEL_NAME)
     qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
@@ -129,6 +133,15 @@ def _ollama_is_available(model: str) -> bool:
         return False
 
 
+def _is_qdrant_available() -> bool:
+    try:
+        url = f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections"
+        response = requests.get(url, timeout=2)
+        return response.ok
+    except requests.RequestException:
+        return False
+
+
 def _normalize_sql_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     normalized_rows: List[Dict[str, Any]] = []
 
@@ -142,22 +155,6 @@ def _normalize_sql_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         normalized_rows.append(normalized_row)
 
     return normalized_rows
-
-
-def _should_use_sql(query: str) -> bool:
-    lowered = query.lower()
-    sql_keywords = (
-        "giá cao nhất",
-        "cao nhất",
-        "đắt nhất",
-        "rẻ nhất",
-        "classic cars",
-        "thuộc dòng",
-        "dòng",
-        "msrp",
-        "buyprice",
-    )
-    return any(keyword in lowered for keyword in sql_keywords)
 
 
 def _format_local_answer(query: str, rows: List[Dict[str, Any]], source: str) -> str:
@@ -199,16 +196,70 @@ def _parse_tool_choice(text: str) -> str:
     return "vector"
 
 
-def _select_tool_with_llm(llm: object, query: str) -> str:
-    if _should_use_sql(query):
-        return "sql"
+def _is_safe_sql(sql: str) -> bool:
+    lowered = sql.strip().lower()
+    if not lowered.startswith("select "):
+        return False
+
+    banned_tokens = (
+        ";",
+        "insert ",
+        "update ",
+        "delete ",
+        "drop ",
+        "alter ",
+        "create ",
+        "truncate ",
+        "grant ",
+        "revoke ",
+        "--",
+        "/*",
+        "*/",
+    )
+    if any(token in lowered for token in banned_tokens):
+        return False
+
+    if (
+        " from " not in lowered
+        and "\nfrom " not in lowered
+        and "\tfrom " not in lowered
+    ):
+        return False
+
+    return True
+
+
+def _build_sql_with_llm(llm: object, query: str) -> str:
+    prompt = (
+        "Bạn là trợ lý tạo câu SQL cho MySQL. "
+        "Chỉ trả về duy nhất 1 câu SELECT hợp lệ.\n"
+        "Bảng: products. Cột cho phép: productCode, productName, productLine, "
+        "productDescription, buyPrice, MSRP.\n"
+        "Không dùng INSERT/UPDATE/DELETE/DDL. Không dùng nhiều câu. "
+        "Không thêm dấu chấm phẩy.\n"
+        "Nếu không chắc, trả về: "
+        "SELECT productName, buyPrice, MSRP, productLine FROM products LIMIT 5\n"
+        f"Câu hỏi: {query}"
+    )
+    response = llm.invoke(prompt)
+    content = getattr(response, "content", str(response)).strip()
+    if content.startswith("```"):
+        lines = [line for line in content.splitlines() if not line.strip().startswith("```")]
+        content = "\n".join(lines).strip()
+    if content.lower().startswith("sql:"):
+        content = content.split(":", 1)[1].strip()
+    return content
+
+
+def _select_tool_with_llm(llm: Optional[object], query: str) -> str:
+    if llm is None:
+        return "vector"
 
     prompt = (
         "Bạn là bộ phân loại tool.\n"
         "Chỉ trả lời đúng 1 từ: SQL hoặc VECTOR.\n"
-        "Quy tắc:\n"
-        "- SQL: câu hỏi về giá cao nhất/thấp nhất, lọc theo dòng sản phẩm, hoặc cần thống kê/so sánh.\n"
-        "- VECTOR: câu hỏi tìm sản phẩm tương tự, gợi ý theo sở thích.\n"
+        "Tự quyết định theo câu hỏi của người dùng.\n"
+        "Gợi ý: SQL khi cần lọc/so sánh/thống kê; VECTOR khi cần tìm tương đồng/gợi ý.\n"
         f"Query: {query}"
     )
     response = llm.invoke(prompt)
@@ -245,12 +296,8 @@ class LocalAgentExecutor:
     def invoke(self, inputs: Dict[str, Any]):
         query = inputs["input"] if isinstance(inputs, dict) else str(inputs)
 
-        if _should_use_sql(query):
-            raw_output = tool_text_to_sql.invoke(query)
-            source = "sql"
-        else:
-            raw_output = tool_vector_search.invoke(query)
-            source = "vector"
+        raw_output = tool_vector_search.invoke(query)
+        source = "vector"
 
         print(f"[TOOL] {source.upper()} | query={query}")
 
@@ -311,6 +358,10 @@ def get_llm() -> Optional[object]:
 
 
 def vector_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    if not _is_qdrant_available():
+        print("[QDRANT] Chưa khởi động, không thể vector search.")
+        return []
+
     model = SentenceTransformer(EMBED_MODEL_NAME)
     qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
@@ -366,22 +417,16 @@ def tool_text_to_sql(query: str) -> str:
     conn = mysql.connector.connect(**MYSQL_CONFIG)
     cursor = conn.cursor(dictionary=True)
 
-    if "giá cao nhất" in query.lower():
-        sql = """
-        SELECT productName, buyPrice, MSRP, productLine
-        FROM products
-        ORDER BY MSRP DESC
-        LIMIT 5
-        """
-    elif "classic cars" in query.lower():
-        sql = """
-        SELECT productName, buyPrice, MSRP, productLine
-        FROM products
-        WHERE productLine = 'Classic Cars'
-        LIMIT 10
-        """
-    else:
-        sql = "SELECT productName, buyPrice, MSRP, productLine FROM products LIMIT 5"
+    llm = get_llm()
+    sql = "SELECT productName, buyPrice, MSRP, productLine FROM products LIMIT 5"
+    if llm is not None:
+        try:
+            sql = _build_sql_with_llm(llm, query)
+            # Kiểm tra an toàn cơ bản trước khi chạy SQL do LLM tạo.
+            if not _is_safe_sql(sql):
+                raise ValueError("Unsafe SQL")
+        except Exception:
+            sql = "SELECT productName, buyPrice, MSRP, productLine FROM products LIMIT 5"
 
     cursor.execute(sql)
     rows = cursor.fetchall()
@@ -397,8 +442,11 @@ def build_agent():
 
     tools = [tool_vector_search, tool_text_to_sql]
 
-    if llm is None or not hasattr(llm, "bind_tools"):
+    if llm is None:
         return LocalAgentExecutor()
+
+    if not hasattr(llm, "bind_tools"):
+        return LLMDecisionAgent(llm)
 
     if isinstance(llm, ChatOllama):
         return LLMDecisionAgent(llm)
